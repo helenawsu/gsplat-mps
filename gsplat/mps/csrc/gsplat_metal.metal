@@ -446,12 +446,13 @@ kernel void nd_rasterize_forward_kernel(
     device int* final_index,
     device float* out_img,
     constant float* background,
-    constant uint2& blockDim, 
+    constant uint2& blockDim,
     uint2 blockIdx [[threadgroup_position_in_grid]],
     uint2 threadIdx [[thread_position_in_threadgroup]]
 ) {
-    // current naive implementation where tile data loading is redundant
-    // TODO tile data should be shared between tile threads
+    // Thread rank within this tile (0..BLOCK_SIZE-1), used for cooperative loading.
+    uint32_t tr = threadIdx.y * blockDim.x + threadIdx.x;
+
     int32_t tile_id = blockIdx.y * tile_bounds.x + blockIdx.x;
     int32_t i = blockIdx.y * blockDim.y + threadIdx.y;
     int32_t j = blockIdx.x * blockDim.x + threadIdx.x;
@@ -459,61 +460,138 @@ kernel void nd_rasterize_forward_kernel(
     float py = (float)i;
     int32_t pix_id = i * (int)img_size.x + j;
 
-    // return if out of bounds
-    if (i >= (int)img_size.y || j >= (int)img_size.x) {
-        return;
+    // Out-of-bounds threads must still participate in all threadgroup_barrier
+    // calls below (a barrier that not all threads reach is undefined behaviour
+    // in Metal). They are marked done=true so they skip the inner render loop.
+    bool inside = (i < (int)img_size.y && j < (int)img_size.x);
+    bool done   = !inside;
+
+    // Gaussian range for this tile
+    int2 range      = read_packed_int2(tile_bins, tile_id);
+    int  num_batches = (range.y - range.x + BLOCK_SIZE - 1) / BLOCK_SIZE;
+
+    // ── Cooperative threadgroup shared memory ────────────────────────────────
+    // Each thread loads ONE Gaussian per batch into threadgroup memory; all 256
+    // threads in the tile then read from this fast local store instead of
+    // independently fetching the same data from (slow) global device memory.
+    // This fixes the naive O(BLOCK_SIZE × N_gaussians) global-memory reads and
+    // brings the kernel in line with the CUDA reference implementation.
+    threadgroup int32_t id_batch        [BLOCK_SIZE];  // gaussian ids
+    threadgroup float3  xy_opacity_batch[BLOCK_SIZE];  // {x, y, opacity}
+    threadgroup float3  conic_batch     [BLOCK_SIZE];  // {a, b, c} inverse cov
+    threadgroup float3  color_batch     [BLOCK_SIZE];  // rgb (channels <= 3)
+
+    // Per-pixel register accumulators
+    float  T       = 1.f;
+    float3 pix_out = {0.f, 0.f, 0.f};
+
+    // Track the last Gaussian index that contributed to this pixel
+    // (used by the backward pass; initialise to range.x-1 for empty tiles).
+    int last_contributor = range.x - 1;
+
+    // Tile-wide activity flag: mirrors CUDA's __syncthreads_count(done).
+    // Thread 0 resets it to false each iteration (before Barrier 1); any
+    // non-done thread sets it to true (between the two barriers).
+    // After Barrier 2 it reliably reflects whether any pixel needs more work.
+    threadgroup bool any_active;
+
+    for (int b = 0; b < num_batches; ++b) {
+        // Thread 0 optimistically marks the tile as all-done.
+        if (tr == 0) any_active = false;
+
+        // ── Barrier 1: reset visible to all + previous batch reads complete ──
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Non-done pixels signal that the tile still has work.
+        // Multiple threads writing the same value (true) is safe in Metal.
+        if (!done) any_active = true;
+
+        // ── Cooperative load: each thread fetches one Gaussian ───────────────
+        int batch_start = range.x + BLOCK_SIZE * b;
+        int load_idx    = batch_start + (int)tr;
+        if (load_idx < range.y) {
+            int32_t g_id         = gaussian_ids_sorted[load_idx];
+            id_batch[tr]          = g_id;
+            float2 xy             = read_packed_float2(xys, g_id);
+            xy_opacity_batch[tr]  = {xy.x, xy.y, opacities[g_id]};
+            conic_batch[tr]       = read_packed_float3(conics, g_id);
+            if (channels <= MAX_REGISTER_CHANNELS) {
+                color_batch[tr] = read_packed_float3(colors, g_id);
+            }
+        }
+
+        // ── Barrier 2: any_active settled + all loads visible ────────────────
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Tile-wide early exit: equivalent to CUDA __syncthreads_count(done).
+        // If every pixel in this tile is saturated, skip remaining batches.
+        if (!any_active) break;
+
+        // ── Each pixel renders its contribution from this batch ───────────────
+        if (!done) {
+            int batch_size = min(BLOCK_SIZE, range.y - batch_start);
+            for (int t = 0; t < batch_size; ++t) {
+                float3 xy_opac = xy_opacity_batch[t];
+                float2 delta   = {xy_opac.x - px, xy_opac.y - py};
+                float3 conic   = conic_batch[t];
+
+                // Mahalanobis distance: sigma = 0.5 * d^T * Sigma^{-1} * d
+                float sigma =
+                    0.5f * (conic.x * delta.x * delta.x +
+                            conic.z * delta.y * delta.y) +
+                    conic.y * delta.x * delta.y;
+                if (sigma < 0.f)
+                    continue;
+
+                float alpha = min(0.999f, xy_opac.z * exp(-sigma));
+                if (alpha < 1.f / 255.f)
+                    continue;
+
+                float next_T = T * (1.f - alpha);
+                if (next_T <= 1e-4f) {
+                    // Pixel is saturated; the Gaussian at t was NOT rendered.
+                    // last_contributor stays as the previous t (already recorded).
+                    done = true;
+                    break;
+                }
+
+                float vis = alpha * T;
+                if (channels <= MAX_REGISTER_CHANNELS) {
+                    // Fast path: read color from threadgroup memory
+                    float3 c = color_batch[t];
+                    pix_out.x += c.x * vis;
+                    pix_out.y += c.y * vis;
+                    pix_out.z += c.z * vis;
+                } else {
+                    // Fallback (channels > 3): read color from global memory
+                    // using the cached gaussian ID from threadgroup mem.
+                    int32_t g = id_batch[t];
+                    for (int c = 0; c < channels; ++c) {
+                        out_img[channels * pix_id + c] +=
+                            colors[channels * g + c] * vis;
+                    }
+                }
+                T = next_T;
+                last_contributor = batch_start + t;
+            }
+        }
     }
 
-    // which gaussians to look through in this tile
-    int2 range = read_packed_int2(tile_bins, tile_id);
-    float T = 1.f;
-
-    // iterate over all gaussians and apply rendering EWA equation (e.q. 2 from
-    // paper)
-    int idx;
-    for (idx = range.x; idx < range.y; ++idx) {
-        const int32_t g = gaussian_ids_sorted[idx];
-        const float3 conic = read_packed_float3(conics, g);
-        const float2 center = read_packed_float2(xys, g);
-        const float2 delta = {center.x - px, center.y - py};
-
-        // Mahalanobis distance (here referred to as sigma) measures how many
-        // standard deviations away distance delta is. sigma = -0.5(d.T * conic
-        // * d)
-        const float sigma =
-            0.5f * (conic.x * delta.x * delta.x + conic.z * delta.y * delta.y) +
-            conic.y * delta.x * delta.y;
-        if (sigma < 0.f) {
-            continue;
+    // ── Write final pixel values (in-bounds pixels only) ─────────────────────
+    if (inside) {
+        final_Ts[pix_id]    = T;
+        final_index[pix_id] = last_contributor;
+        if (channels <= MAX_REGISTER_CHANNELS) {
+            out_img[channels * pix_id + 0] = pix_out.x + T * background[0];
+            out_img[channels * pix_id + 1] = pix_out.y + T * background[1];
+            out_img[channels * pix_id + 2] = pix_out.z + T * background[2];
+        } else {
+            // For channels > 3 the color was written incrementally above;
+            // just add the background transmittance term.
+            for (int c = 0; c < channels; ++c) {
+                out_img[channels * pix_id + c] += T * background[c];
+            }
         }
-        const float opac = opacities[g];
-
-        const float alpha = min(0.999f, opac * exp(-sigma));
-
-        // break out conditions
-        if (alpha < 1.f / 255.f) {
-            continue;
-        }
-        const float next_T = T * (1.f - alpha);
-        if (next_T <= 1e-4f) {
-            // we want to render the last gaussian that contributes and note
-            // that here idx > range.x so we don't underflow
-            idx -= 1;
-            break;
-        }
-        const float vis = alpha * T;
-        for (int c = 0; c < channels; ++c) {
-            out_img[channels * pix_id + c] += colors[channels * g + c] * vis;
-        }
-        T = next_T;
-    }
-    final_Ts[pix_id] = T; // transmittance at last gaussian in this pixel
-    final_index[pix_id] =
-        (idx == range.y)
-            ? idx - 1
-            : idx; // index of in bin of last gaussian in this pixel
-    for (int c = 0; c < channels; ++c) {
-        out_img[channels * pix_id + c] += T * background[c];
     }
 }
 

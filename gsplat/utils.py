@@ -1,5 +1,6 @@
 """Python bindings for binning and sorting gaussians"""
 
+import time as _time
 from typing import Tuple
 
 from jaxtyping import Float, Int
@@ -7,6 +8,9 @@ from torch import Tensor
 import torch
 
 import gsplat.mps as _C
+
+# Set to True by viewer.py DEBUG_PERF to time torch.sort in bin_and_sort_gaussians.
+_sort_debug: bool = False
 
 
 def map_gaussian_to_intersects(
@@ -161,7 +165,19 @@ def bin_and_sort_gaussians(
     isect_ids, gaussian_ids = map_gaussian_to_intersects(
         num_points, num_intersects, xys, depths, radii, cum_tiles_hit, tile_bounds
     )
+
+    _t0 = _time.perf_counter()
     isect_ids_sorted, sorted_indices = torch.sort(isect_ids)
+    if _sort_debug and isect_ids.device.type == "mps":
+        torch.mps.synchronize()
+    _t_sort = _time.perf_counter() - _t0
+
+    if _sort_debug:
+        print(
+            f"[SORT    n={isect_ids.numel():,}  device={isect_ids.device}  "
+            f"sort={_t_sort*1000:.1f}ms]"
+        )
+
     gaussian_ids_sorted = torch.gather(gaussian_ids, 0, sorted_indices)
     tile_bins = get_tile_bin_edges(num_intersects, isect_ids_sorted)
     return isect_ids, gaussian_ids, isect_ids_sorted, gaussian_ids_sorted, tile_bins

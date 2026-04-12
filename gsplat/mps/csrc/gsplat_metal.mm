@@ -70,7 +70,17 @@ MetalContext* init_gsplat_metal_context() {
     } else {
         printf("%s: default.metallib not found, loading from source\n", __func__);
 
+        // __FILE__ may be a relative path captured at compile time; if the
+        // .metal source cannot be found relative to the current working dir,
+        // fall back to looking in the csrc/ directory that lives alongside the
+        // installed shared-library (.so), which is always an absolute path.
         NSString * source_path = [[@ __FILE__ stringByDeletingLastPathComponent] stringByAppendingPathComponent:@"gsplat_metal.metal"];
+        if (![[NSFileManager defaultManager] fileExistsAtPath:source_path]) {
+            // The .so lives in gsplat/, so bundlePath is .../gsplat/.
+            // The .metal file is at .../gsplat/mps/csrc/gsplat_metal.metal.
+            NSBundle * ext_bundle = [NSBundle bundleForClass:[DummyClassForPathHack class]];
+            source_path = [[ext_bundle bundlePath] stringByAppendingPathComponent:@"mps/csrc/gsplat_metal.metal"];
+        }
         printf("%s: loading '%s'\n", __func__, [source_path UTF8String]);
 
         NSString * src = [NSString stringWithContentsOfFile:source_path encoding:NSUTF8StringEncoding error:&error];
