@@ -850,27 +850,28 @@ kernel void map_gaussian_to_intersects_kernel(
 // expect that intersection IDs are sorted by increasing tile ID
 // i.e. intersections of a tile are in contiguous chunks
 kernel void get_tile_bin_edges_kernel(
-    constant int& num_intersects, 
-    constant int64_t* isect_ids_sorted, 
+    constant int& num_intersects,
+    constant int64_t* isect_ids_sorted,
     device int* tile_bins, // int2
     uint idx [[thread_position_in_grid]]
 ) {
     if (idx >= num_intersects)
         return;
-    // save the indices where the tile_id changes
     int32_t cur_tile_idx = (int32_t)(isect_ids_sorted[idx] >> 32);
-    if (idx == 0 || idx == num_intersects - 1) {
-        if (idx == 0)
-            write_packed_int2x(tile_bins, cur_tile_idx, 0);
-        if (idx == num_intersects - 1)
-            write_packed_int2y(tile_bins, cur_tile_idx, num_intersects);
-        return;
+    if (idx == 0) {
+        // first entry: write start of first tile
+        write_packed_int2x(tile_bins, cur_tile_idx, 0);
+    } else {
+        // check for tile transition (including at the last element)
+        int32_t prev_tile_idx = (int32_t)(isect_ids_sorted[idx - 1] >> 32);
+        if (prev_tile_idx != cur_tile_idx) {
+            write_packed_int2y(tile_bins, prev_tile_idx, idx);
+            write_packed_int2x(tile_bins, cur_tile_idx, idx);
+        }
     }
-    int32_t prev_tile_idx = (int32_t)(isect_ids_sorted[idx - 1] >> 32);
-    if (prev_tile_idx != cur_tile_idx) {
-        write_packed_int2y(tile_bins, prev_tile_idx, idx);
-        write_packed_int2x(tile_bins, cur_tile_idx, idx);
-        return;
+    if (idx == num_intersects - 1) {
+        // last entry: write end of last tile
+        write_packed_int2y(tile_bins, cur_tile_idx, num_intersects);
     }
 }
 
