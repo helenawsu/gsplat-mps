@@ -9,7 +9,7 @@ import torch
 
 import gsplat.mps as _C
 
-# Set to True by viewer.py DEBUG_PERF to time torch.sort in bin_and_sort_gaussians.
+# Set per-frame by wind_3dgs/render.py when perf_debug=True.
 _sort_debug: bool = False
 
 
@@ -179,5 +179,13 @@ def bin_and_sort_gaussians(
         )
 
     gaussian_ids_sorted = torch.gather(gaussian_ids, 0, sorted_indices)
+    if _sort_debug and num_intersects > 0:
+        first_tid = int((isect_ids_sorted[0] >> 32).item())
+        last_tid  = int((isect_ids_sorted[-1] >> 32).item())
+        print(f"[ISECT  first_tile_id={first_tid}  last_tile_id={last_tid}  num_intersects={num_intersects}]")
     tile_bins = get_tile_bin_edges(num_intersects, isect_ids_sorted)
+    if _sort_debug:
+        tile_counts = tile_bins[:, 1] - tile_bins[:, 0]
+        nz = tile_counts[tile_counts > 0]  # filter phantom (0,0) rows from over-allocated buffer
+        print(f"[TILES  max={nz.max().item()}  p99={nz.float().quantile(0.99).item():.0f}  mean={nz.float().mean():.1f}  n_tiles={nz.shape[0]}]")
     return isect_ids, gaussian_ids, isect_ids_sorted, gaussian_ids_sorted, tile_bins
